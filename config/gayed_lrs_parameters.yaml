@@ -1,0 +1,288 @@
+project:
+  name: gayed_lrs_long_only
+  version: 0.1.0
+  base_currency: USD
+  source_document: Gayed Bilello 2016.pdf
+  rule_spec_document: docs/gayed_lrs_rule_and_backtest_spec.md
+  workflow_document: docs/project_structure_and_workflow.md
+  task_breakdown_document: docs/implementation_task_breakdown.md
+
+data:
+  frequency: 1d
+  market_timezone: America/New_York
+  data_source: yfinance
+  start_date: 1993-01-29
+  end_date: latest_available
+  warmup_bars: 220
+  signal_price_field: adjusted_close
+  execution_price_field: adjusted_open
+  calculate_adjusted_open_from_ohlc: true
+  missing_data_policy: drop_rows_with_missing_signal_or_execution_price
+
+  test_universe:
+    - id: US_LARGE_CAP
+      ticker: SPY
+      region: US
+      exposure: S&P 500 large-cap equities
+      role: paper_baseline
+    - id: US_NASDAQ_100
+      ticker: QQQ
+      region: US
+      exposure: Nasdaq-100 growth and technology-heavy equities
+      role: us_variant
+    - id: US_SMALL_CAP
+      ticker: IWM
+      region: US
+      exposure: Russell 2000 small-cap equities
+      role: us_variant
+    - id: EUROPE_DEVELOPED
+      ticker: VGK
+      region: Europe
+      exposure: Developed Europe equities
+      role: europe_variant
+    - id: EUROZONE
+      ticker: EZU
+      region: Europe
+      exposure: Eurozone large- and mid-cap equities
+      role: europe_variant
+
+  leveraged_execution:
+    - signal_ticker: SPY
+      execution_assets:
+        - id: SPY_1X
+          ticker: SPY
+          leverage: 1.0
+          mode: observed_etf
+        - id: SSO_2X
+          ticker: SSO
+          leverage: 2.0
+          mode: observed_leveraged_etf
+        - id: UPRO_3X
+          ticker: UPRO
+          leverage: 3.0
+          mode: observed_leveraged_etf
+    - signal_ticker: QQQ
+      execution_assets:
+        - id: QQQ_1X
+          ticker: QQQ
+          leverage: 1.0
+          mode: observed_etf
+        - id: QLD_2X
+          ticker: QLD
+          leverage: 2.0
+          mode: observed_leveraged_etf
+        - id: TQQQ_3X
+          ticker: TQQQ
+          leverage: 3.0
+          mode: observed_leveraged_etf
+    - signal_ticker: IWM
+      execution_assets:
+        - id: IWM_1X
+          ticker: IWM
+          leverage: 1.0
+          mode: observed_etf
+        - id: UWM_2X
+          ticker: UWM
+          leverage: 2.0
+          mode: observed_leveraged_etf
+        - id: TNA_3X
+          ticker: TNA
+          leverage: 3.0
+          mode: observed_leveraged_etf
+    - signal_ticker: VGK
+      execution_assets:
+        - id: VGK_1X
+          ticker: VGK
+          leverage: 1.0
+          mode: observed_etf
+        - id: VGK_SYNTHETIC_2X
+          ticker:
+          leverage: 2.0
+          mode: synthetic_from_signal_etf
+        - id: VGK_SYNTHETIC_3X
+          ticker:
+          leverage: 3.0
+          mode: synthetic_from_signal_etf
+    - signal_ticker: EZU
+      execution_assets:
+        - id: EZU_1X
+          ticker: EZU
+          leverage: 1.0
+          mode: observed_etf
+        - id: EZU_SYNTHETIC_2X
+          ticker:
+          leverage: 2.0
+          mode: synthetic_from_signal_etf
+        - id: EZU_SYNTHETIC_3X
+          ticker:
+          leverage: 3.0
+          mode: synthetic_from_signal_etf
+
+  risk_off:
+    primary_asset: CASH
+    comparison_assets:
+      - BIL
+    fallback_asset: CASH
+    fallback_rule: use_cash_for_primary_profitability_test
+    cash_daily_return: 0.0
+
+strategy:
+  name: Gayed_LRS_Long_Only
+  direction: long_only
+  allow_short: false
+  portfolio_mode: independent_single_asset_tests
+  experiment_objective: validate_long_leveraged_etf_profitability
+  phase_1_leverage_multiplier: 1.0
+  position_when_risk_on: long_configured_execution_asset
+  position_when_risk_off: risk_off
+
+  baseline_filter:
+    id: SMA_200
+    type: SMA
+    length: 200
+
+  candidate_filters:
+    - id: SMA_200
+      type: SMA
+      length: 200
+    - id: EMA_190
+      type: EMA
+      length: 190
+    - id: EMA_195
+      type: EMA
+      length: 195
+    - id: EMA_200
+      type: EMA
+      length: 200
+
+  sensitivity_filters:
+    type: EMA
+    min_length: 180
+    max_length: 210
+    step: 5
+
+  entry_rule: enter_long_when_close_crosses_from_at_or_below_filter_to_above_filter
+  exit_rule: exit_long_when_close_crosses_from_above_filter_to_at_or_below_filter
+  equality_rule: close_equal_to_filter_is_risk_off
+  initial_state_before_first_valid_signal: risk_off
+
+  false_breakout:
+    trading_filter_enabled: false
+    diagnostics_enabled: true
+    definition: round_trip_exit_within_n_sessions_after_entry
+    whipsaw_window_sessions: 20
+    track_entry_distance_from_filter_pct: true
+    track_volatility_at_entry: true
+    track_filter_slope_at_entry: true
+    decision_rule: measure_first_then_decide_after_phase_1_backtest
+
+  stops:
+    protective_stop_loss_enabled: false
+    trailing_stop_enabled: false
+    atr_stop_enabled: false
+
+execution:
+  signal_timing: confirmed_daily_close
+  execution_timing: next_session_open
+  rebalance_policy: on_signal_change_only
+  position_size_pct: 1.0
+  initial_capital: 100000.0
+  allow_fractional_shares: true
+  cash_buffer_pct: 0.0
+  lookahead_bias_guard: true
+
+costs:
+  commission_bps_per_side: 0.0
+  slippage_bps_per_side: 1.0
+  spread_bps_per_side: 1.0
+  apply_expense_ratios_to_observed_etf_prices: false
+  synthetic_leverage_fee_bps_per_year: 100.0
+
+alerts:
+  enabled: true
+  alert_timezone: America/New_York
+  evaluate_after_market_close: true
+  post_close_delay_minutes: 15
+  send_when_signal_unchanged: false
+  buy_alert_name: BUY_ALERT
+  exit_alert_name: EXIT_ALERT
+  no_change_name: NO_CHANGE
+  channels:
+    console: true
+    file: true
+    email: false
+    webhook: false
+  output_file: outputs/alerts/gayed_lrs_alerts.csv
+
+backtest:
+  fixed_rule_backtest_enabled: true
+  walk_forward_enabled: true
+  sensitivity_review_enabled: true
+  benchmark_mode: buy_and_hold_same_etf
+
+  walk_forward:
+    training_window_years: 10
+    test_window_years: 2
+    step_months: 6
+    selection_objective: risk_adjusted_composite_score
+    score_weights:
+      cagr: 0.25
+      sharpe_ratio: 0.25
+      sortino_ratio: 0.20
+      max_drawdown_penalty: 0.20
+      calmar_ratio: 0.10
+
+  rolling_windows:
+    - 3y
+    - 5y
+
+  subperiods:
+    - id: pre_2000
+      start: 1993-01-29
+      end: 1999-12-31
+    - id: dotcom_and_gfc
+      start: 2000-01-01
+      end: 2009-12-31
+    - id: post_gfc_expansion
+      start: 2010-01-01
+      end: 2019-12-31
+    - id: pandemic_and_after
+      start: 2020-01-01
+      end: latest_available
+
+future_extensions:
+  combined_multi_asset_portfolio_enabled: false
+  stop_loss_overlays_enabled: false
+  bil_risk_off_comparison_enabled: false
+
+reporting:
+  output_directory: outputs/backtests
+  report_directory: reports
+  chart_directory: reports/charts
+  table_directory: reports/tables
+  final_report_file: reports/final_strategy_review.md
+  metrics:
+    - CAGR
+    - annualized_volatility
+    - sharpe_ratio
+    - sortino_ratio
+    - calmar_ratio
+    - max_drawdown
+    - exposure_pct
+    - trades_per_year
+    - average_hold_days
+    - win_rate_by_trade
+    - profit_factor
+    - rolling_3y_outperformance
+    - rolling_5y_cagr
+    - rolling_5y_max_drawdown
+
+validation:
+  require_no_missing_required_parameters: true
+  require_no_lookahead_bias: true
+  require_long_only: true
+  require_same_costs_across_candidates: true
+  require_same_execution_rule_across_candidates: true
+  require_buy_and_hold_benchmark_per_etf: true
+  require_parameter_plateau_review: true
+  require_walk_forward_results_before_final_selection: true

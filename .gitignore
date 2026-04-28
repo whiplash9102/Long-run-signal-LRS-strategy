@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest
+.pytest_cache/
+
+# Large Data Files
+data/raw/*.csv
+data/processed/*.csv
+
+# Large Backtest Outputs
+outputs/backtests/*.csv
+outputs/backtests/*.parquet
+
+# Report Tables (optional, but they are generated so it's good to ignore to avoid clutter)
+# We can track the small markdown files, but ignore the CSVs
+reports/tables/*.csv
+
+# Ignore MacOS specific
+.DS_Store

@@ -13,6 +13,8 @@ data/processed/*.csv
 # Large Backtest Outputs
 outputs/backtests/*.csv
 outputs/backtests/*.parquet
+outputs/alerts/*.json
+outputs/alerts/*.txt
 
 # Report Tables (optional, but they are generated so it's good to ignore to avoid clutter)
 # We can track the small markdown files, but ignore the CSVs

@@ -88,3 +88,33 @@ conda run -n final_project python scripts/export_pdf.py
 With Phase 1 (Research & Validation) complete, the project is moving towards live execution readiness:
 - **Alert System:** Building a real-time alerting layer to evaluate end-of-day closing prices against the active moving average filter and trigger trade notifications.
 - **Paper Trading:** Running the system forward on live data without capital at risk to monitor execution slippage and operational friction.
+
+## Morning Email Alert
+
+The repository includes a GitHub Actions workflow that can send a morning US-market alert by email:
+
+```bash
+python scripts/send_market_alert.py --dry-run --force-market
+```
+
+The alert refreshes data, rebuilds indicators/signals, and emails the latest confirmed recommendation for each configured signal ETF and candidate filter:
+
+- `INVEST`: latest confirmed close crossed above the filter.
+- `EXIT`: latest confirmed close crossed at or below the filter.
+- `HOLD_INVESTED`: signal remains long.
+- `HOLD_CASH`: signal remains risk-off.
+
+False-breakout warnings are included for fresh `INVEST` alerts. They are probabilistic diagnostics based on historical whipsaw behavior, not proof that a new entry will fail.
+
+To enable the workflow, add these GitHub repository secrets:
+
+```text
+SMTP_HOST
+SMTP_PORT
+SMTP_USERNAME
+SMTP_PASSWORD
+ALERT_EMAIL_FROM
+ALERT_EMAIL_TO
+```
+
+For Gmail, use `smtp.gmail.com`, port `587`, your Gmail address as `SMTP_USERNAME`, and a Gmail App Password as `SMTP_PASSWORD`.

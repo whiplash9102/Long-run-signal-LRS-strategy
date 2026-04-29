@@ -53,6 +53,8 @@ class AlertRow:
     historical_whipsaw_rate: float | None = None
     similar_whipsaw_rate: float | None = None
     similar_sample_size: int = 0
+    new_entrant_tier: str = "N/A"
+    new_entrant_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -150,6 +152,14 @@ def build_market_alert(
                 entry_distance_pct=features.get("entry_distance_pct"),
                 filter_slope_pct=features.get("filter_slope_pct"),
             )
+            entrant = _new_entrant_guidance(
+                action=action,
+                entry_distance_pct=features.get("entry_distance_pct"),
+                filter_slope_pct=features.get("filter_slope_pct"),
+                audit_entries=audit_entries,
+                ticker=ticker,
+                filter_id=filter_id,
+            )
             rows.append(
                 AlertRow(
                     ticker=ticker,
@@ -170,6 +180,8 @@ def build_market_alert(
                     historical_whipsaw_rate=warning["historical_whipsaw_rate"],
                     similar_whipsaw_rate=warning["similar_whipsaw_rate"],
                     similar_sample_size=int(warning["similar_sample_size"]),
+                    new_entrant_tier=entrant["tier"],
+                    new_entrant_note=entrant["note"],
                 )
             )
 
@@ -419,6 +431,113 @@ def _false_breakout_warning(
     }
 
 
+_ENTRANT_TIER_ENTER = "ENTER"
+_ENTRANT_TIER_CAUTION = "CAUTION"
+_ENTRANT_TIER_WAIT = "WAIT"
+_ENTRANT_TIER_FRESH = "FRESH_SIGNAL"
+_ENTRANT_TIER_NA = "N/A"
+
+# Whipsaw rates by distance bucket, derived from the Phase 1 false-breakout audit.
+# Used to add historical context to new-entrant notes.
+_WHIPSAW_BY_DISTANCE: list[tuple[float, float, str]] = [
+    # (dist_lo, dist_hi, label)
+    (0.00, 0.01, "76.7%"),
+    (0.01, 0.02, "65.0%"),
+    (0.02, 0.03, "47.9%"),
+    (0.03, 0.05, "45.6%"),
+    (0.05, 1.00, "~50–65% (small historical sample)"),
+]
+
+
+def _whipsaw_rate_label(distance: float) -> str:
+    for lo, hi, label in _WHIPSAW_BY_DISTANCE:
+        if lo <= distance < hi:
+            return label
+    return "unknown"
+
+
+def _new_entrant_guidance(
+    action: str,
+    entry_distance_pct: float | None,
+    filter_slope_pct: float | None,
+    audit_entries: pd.DataFrame,
+    ticker: str,
+    filter_id: str,
+) -> dict[str, str]:
+    """Guidance for a new entrant with no existing position."""
+    if action == "INVEST":
+        return {
+            "tier": _ENTRANT_TIER_FRESH,
+            "note": (
+                "Fresh INVEST signal. This is the strategy's entry trigger. "
+                "See the false-breakout warning above for historical whipsaw context."
+            ),
+        }
+
+    if action not in ("HOLD_INVESTED",):
+        return {
+            "tier": _ENTRANT_TIER_NA,
+            "note": "Market is not in a LONG regime. No entry case for a new entrant.",
+        }
+
+    dist = entry_distance_pct
+    slope = filter_slope_pct
+
+    if dist is None:
+        return {"tier": "UNKNOWN", "note": "Cannot compute regime cushion — distance data unavailable."}
+
+    historical_note = ""
+    if not audit_entries.empty:
+        completed = audit_entries[
+            (audit_entries["ticker"] == ticker)
+            & (audit_entries["filter_id"] == filter_id)
+            & (audit_entries["exit_date"].notna())
+        ]
+        if len(completed) >= 5:
+            baseline = float(completed["whipsaw"].astype(bool).mean())
+            historical_note = (
+                f" When the next INVEST signal eventually fires, the historical whipsaw rate "
+                f"for {ticker}/{filter_id} is {baseline * 100:.0f}% overall "
+                f"(entries at <1% above filter: ~77%; at 2–5%: ~46%)."
+            )
+
+    dist_pct_str = f"{dist * 100:.1f}%"
+    slope_str = f"{slope * 100:.2f}%" if slope is not None else "unknown"
+    slope_ok = slope is None or slope >= -0.001
+
+    if dist > 0.03 and slope_ok:
+        tier = _ENTRANT_TIER_ENTER
+        note = (
+            f"Regime is well established. Price is {dist_pct_str} above the filter "
+            f"(slope {slope_str}/period). "
+            f"Entering mid-regime is consistent with the strategy's risk-on rule. "
+            f"The exit trigger fires only if price falls back to the filter — "
+            f"currently {dist_pct_str} below today's close."
+            f"{historical_note}"
+        )
+    elif dist > 0.015:
+        tier = _ENTRANT_TIER_CAUTION
+        note = (
+            f"Price is {dist_pct_str} above the filter (slope {slope_str}/period). "
+            f"Cushion is moderate. Consider entering at a reduced initial size, "
+            f"or waiting for a pullback and re-entry on a fresh INVEST signal with wider distance."
+            f"{historical_note}"
+        )
+    else:
+        whipsaw_label = _whipsaw_rate_label(dist)
+        tier = _ENTRANT_TIER_WAIT
+        note = (
+            f"Price is only {dist_pct_str} above the filter (slope {slope_str}/period). "
+            f"This is effectively at the filter boundary. "
+            f"Historical whipsaw rate for entries at this distance: {whipsaw_label}. "
+            f"Wait for a clearer re-entry — a fresh INVEST signal with at least 2–3% distance "
+            f"cuts historical whipsaw risk to roughly half."
+            f"{historical_note}"
+        )
+
+    return {"tier": tier, "note": note}
+
+
 def _unknown_warning(note: str) -> dict[str, Any]:
     return {
         "level": "UNKNOWN",
@@ -473,6 +592,12 @@ def _build_text_body(
             f"distance={_format_pct(row.entry_distance_pct)}, slope={_format_pct(row.filter_slope_pct)}. "
             f"{row.false_breakout_note}"
         )
+    lines.extend(["", "New Entrant Guidance (no existing position):"])
+    for row in rows:
+        if row.new_entrant_tier not in ("N/A", "UNKNOWN", ""):
+            lines.append(
+                f"- {row.ticker}/{row.filter_id}: [{row.new_entrant_tier}] {row.new_entrant_note}"
+            )
     lines.extend(
         [
             "",
@@ -482,6 +607,7 @@ def _build_text_body(
             "- HOLD_INVESTED means the signal remains LONG.",
             "- HOLD_CASH means the signal remains RISK_OFF.",
             "- False-breakout warnings are probabilistic and use historical whipsaw diagnostics.",
+            "- New Entrant tiers: ENTER (>3% above filter, slope ok) | CAUTION (1.5-3%) | WAIT (<1.5%) | FRESH_SIGNAL (at cross).",
         ]
     )
     return "\n".join(lines)
@@ -492,6 +618,22 @@ def _build_html_body(
     generated_at_et: datetime,
     rows: tuple[AlertRow, ...],
 ) -> str:
+    _TIER_COLOR = {
+        "ENTER": "#1a7a1a",
+        "CAUTION": "#b36b00",
+        "WAIT": "#a80000",
+        "FRESH_SIGNAL": "#0055a0",
+        "N/A": "#555555",
+        "UNKNOWN": "#555555",
+    }
+
+    def _tier_badge(tier: str) -> str:
+        color = _TIER_COLOR.get(tier, "#555555")
+        return (
+            f'<span style="background:{color};color:#fff;padding:2px 7px;'
+            f'border-radius:3px;font-size:0.85em;font-weight:bold;">{tier}</span>'
+        )
+
     row_html = "\n".join(
         "<tr>"
         f"<td>{row.ticker}</td>"
@@ -513,6 +655,32 @@ def _build_html_body(
         "</li>"
         for row in rows
     )
+    entrant_rows = [r for r in rows if r.new_entrant_tier not in ("N/A", "UNKNOWN", "")]
+    entrant_html = "\n".join(
+        "<tr>"
+        f"<td><strong>{row.ticker}/{row.filter_id}</strong></td>"
+        f"<td>{_tier_badge(row.new_entrant_tier)}</td>"
+        f"<td style='font-size:0.9em'>{row.new_entrant_note}</td>"
+        "</tr>"
+        for row in entrant_rows
+    )
+    entrant_section = ""
+    if entrant_html:
+        entrant_section = f"""
+  <h3>New Entrant Guidance</h3>
+  <p style="font-size:0.85em;color:#444;">
+    For investors with no existing position.
+    <strong>ENTER</strong> = &gt;3% above filter, slope positive.
+    <strong>CAUTION</strong> = 1.5–3% above filter.
+    <strong>WAIT</strong> = &lt;1.5% above filter (high whipsaw risk at next cross).
+  </p>
+  <table border="1" cellpadding="6" cellspacing="0">
+    <thead>
+      <tr><th>Ticker/Filter</th><th>Tier</th><th>Note</th></tr>
+    </thead>
+    <tbody>{entrant_html}</tbody>
+  </table>"""
+
     return f"""<!doctype html>
 <html>
 <body>
@@ -531,6 +699,7 @@ def _build_html_body(
   <h3>Details</h3>
   <ul>{detail_html}</ul>
   <p><em>False-breakout warnings are probabilistic and use historical whipsaw diagnostics.</em></p>
+  {entrant_section}
 </body>
 </html>"""
 

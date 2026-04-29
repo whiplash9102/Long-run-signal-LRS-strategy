@@ -21,7 +21,7 @@ from src.alerts.market_alert import (  # noqa: E402
     write_alert_outputs,
 )
 from src.config_loader import load_config  # noqa: E402
-from src.data.market_data import run_data_pipeline  # noqa: E402
+from src.data.market_data import run_data_pipeline, run_data_pipeline_incremental  # noqa: E402
 from src.strategy.indicators import run_indicator_pipeline  # noqa: E402
 from src.strategy.signals import run_signal_pipeline  # noqa: E402
 
@@ -35,6 +35,7 @@ def main() -> int:
     parser.add_argument("--market-date", help="Override market date as YYYY-MM-DD.")
     parser.add_argument("--force-market", action="store_true", help="Send/build even if market is closed.")
     parser.add_argument("--no-refresh", action="store_true", help="Use existing processed CSV files.")
+    parser.add_argument("--full-refresh", action="store_true", help="Force full historical re-download (slow). Default is incremental.")
     parser.add_argument("--dry-run", action="store_true", help="Print and write output without sending email.")
     args = parser.parse_args()
 
@@ -45,7 +46,10 @@ def main() -> int:
 
     config = load_config(args.config)
     if not args.no_refresh:
-        run_data_pipeline(config)
+        if args.full_refresh:
+            run_data_pipeline(config)
+        else:
+            run_data_pipeline_incremental(config)
         run_indicator_pipeline(config)
         run_signal_pipeline(config)
 

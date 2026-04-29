@@ -247,12 +247,26 @@ def is_us_market_day(day: date) -> bool:
     return day not in holidays
 
 
+_PRECOMPUTED_AUDIT_PATH = Path("reports/tables/false_breakout_audit_entries.csv")
+
+
 def _build_audit_entries(
     config: dict[str, Any],
     prices: pd.DataFrame,
     indicators: pd.DataFrame,
     signals: pd.DataFrame,
 ) -> pd.DataFrame:
+    """Load pre-computed audit CSV if available; otherwise rebuild from scratch.
+
+    The audit CSV is produced once by scripts/audit_false_breakouts.py and changes
+    only when the full backtest is re-run. Loading it avoids a costly rebuild on
+    every daily alert.
+    """
+    if _PRECOMPUTED_AUDIT_PATH.exists():
+        df = pd.read_csv(_PRECOMPUTED_AUDIT_PATH)
+        if "entry_date" in df.columns and "exit_date" in df.columns:
+            return df
+
     whipsaw_window_sessions = int(config["strategy"]["false_breakout"]["whipsaw_window_sessions"])
     audit = build_false_breakout_audit(
         prices=prices,
@@ -618,88 +632,236 @@ def _build_html_body(
     generated_at_et: datetime,
     rows: tuple[AlertRow, ...],
 ) -> str:
-    _TIER_COLOR = {
-        "ENTER": "#1a7a1a",
-        "CAUTION": "#b36b00",
-        "WAIT": "#a80000",
-        "FRESH_SIGNAL": "#0055a0",
-        "N/A": "#555555",
-        "UNKNOWN": "#555555",
+    # ── colour palettes ──────────────────────────────────────────────────────
+    _ACTION_BG = {
+        "INVEST":        ("#155724", "#fff"),
+        "HOLD_INVESTED": ("#d4edda", "#155724"),
+        "EXIT":          ("#721c24", "#fff"),
+        "HOLD_CASH":     ("#f8d7da", "#721c24"),
+    }
+    _TIER_BG = {
+        "ENTER":        ("#d4edda", "#155724"),
+        "CAUTION":      ("#fff3cd", "#856404"),
+        "WAIT":         ("#f8d7da", "#721c24"),
+        "FRESH_SIGNAL": ("#cce5ff", "#004085"),
     }
 
-    def _tier_badge(tier: str) -> str:
-        color = _TIER_COLOR.get(tier, "#555555")
+    def _action_badge(action: str) -> str:
+        bg, fg = _ACTION_BG.get(action, ("#e2e3e5", "#383d41"))
+        label = {
+            "INVEST": "INVEST ↑", "HOLD_INVESTED": "HOLD LONG ✓",
+            "EXIT": "EXIT ↓", "HOLD_CASH": "HOLD CASH",
+        }.get(action, action)
         return (
-            f'<span style="background:{color};color:#fff;padding:2px 7px;'
-            f'border-radius:3px;font-size:0.85em;font-weight:bold;">{tier}</span>'
+            f'<span style="background:{bg};color:{fg};padding:3px 9px;border-radius:4px;'
+            f'font-weight:bold;font-size:0.82em;white-space:nowrap;">{label}</span>'
         )
 
-    row_html = "\n".join(
+    def _tier_badge(tier: str) -> str:
+        bg, fg = _TIER_BG.get(tier, ("#e2e3e5", "#383d41"))
+        return (
+            f'<span style="background:{bg};color:{fg};padding:3px 9px;border-radius:4px;'
+            f'font-weight:bold;font-size:0.82em;white-space:nowrap;">{tier}</span>'
+        )
+
+    def _distance_cell(dist: float | None) -> str:
+        if dist is None:
+            return '<td style="padding:10px;font-size:0.88em;color:#888;">n/a</td>'
+        pct = dist * 100
+        if pct > 5:
+            color, bar_color = "#155724", "#28a745"
+        elif pct > 2:
+            color, bar_color = "#856404", "#ffc107"
+        else:
+            color, bar_color = "#721c24", "#dc3545"
+        fill = min(int(pct / 15 * 60), 60)
+        bar = (
+            f'<div style="width:60px;height:6px;background:#eee;border-radius:3px;margin-top:4px;">'
+            f'<div style="width:{fill}px;height:6px;background:{bar_color};border-radius:3px;"></div>'
+            f'</div>'
+        )
+        return (
+            f'<td style="padding:10px;font-size:0.88em;">'
+            f'<span style="color:{color};font-weight:bold;">{pct:.1f}%</span>{bar}'
+            f'</td>'
+        )
+
+    def _slope_cell(slope: float | None) -> str:
+        if slope is None:
+            return '<td style="padding:10px;font-size:0.88em;color:#888;">n/a</td>'
+        pct = slope * 100
+        if pct > 0.001:
+            arrow, color = "↑", "#28a745"
+        elif pct < -0.001:
+            arrow, color = "↓", "#dc3545"
+        else:
+            arrow, color = "→", "#888"
+        return (
+            f'<td style="padding:10px;font-size:0.88em;">'
+            f'<span style="color:{color};font-weight:bold;">{arrow} {abs(pct):.2f}%</span>'
+            f'</td>'
+        )
+
+    def _fb_warning_cell(level: str) -> str:
+        styles = {
+            "HIGH":     ("background:#f8d7da;color:#721c24;", "HIGH ⚠"),
+            "ELEVATED": ("background:#fff3cd;color:#856404;", "ELEVATED"),
+            "NORMAL":   ("background:#d4edda;color:#155724;", "NORMAL"),
+            "N/A":      ("color:#888;", "N/A"),
+        }
+        style, label = styles.get(level, ("color:#888;", level))
+        return (
+            f'<td style="padding:10px;font-size:0.82em;">'
+            f'<span style="{style}padding:2px 6px;border-radius:3px;">{label}</span>'
+            f'</td>'
+        )
+
+    # ── summary counts ────────────────────────────────────────────────────────
+    n_invest      = sum(r.action == "INVEST" for r in rows)
+    n_hold_long   = sum(r.action == "HOLD_INVESTED" for r in rows)
+    n_exit        = sum(r.action == "EXIT" for r in rows)
+    n_hold_cash   = sum(r.action == "HOLD_CASH" for r in rows)
+
+    def _summary_box(value: int, label: str, bg: str, fg: str) -> str:
+        return (
+            f'<td style="padding:12px 16px;text-align:center;background:{bg};'
+            f'border-radius:6px;margin:4px;">'
+            f'<div style="font-size:1.6em;font-weight:bold;color:{fg};">{value}</div>'
+            f'<div style="font-size:0.72em;color:{fg};opacity:0.8;margin-top:2px;">{label}</div>'
+            f'</td>'
+        )
+
+    summary_html = (
+        '<table cellpadding="4" cellspacing="0" style="width:100%;">'
         "<tr>"
-        f"<td>{row.ticker}</td>"
-        f"<td>{row.filter_id}</td>"
-        f"<td><strong>{row.action}</strong></td>"
-        f"<td>{row.position_state}</td>"
-        f"<td>{row.signal_date}</td>"
-        f"<td>{row.false_breakout_warning}</td>"
-        f"<td>{row.execution_assets}</td>"
-        "</tr>"
-        for row in rows
+        + _summary_box(n_invest,    "NEW INVEST",  "#d4edda", "#155724")
+        + _summary_box(n_hold_long, "HOLDING LONG","#eaf4ff", "#004085")
+        + _summary_box(n_exit,      "NEW EXIT",    "#f8d7da", "#721c24")
+        + _summary_box(n_hold_cash, "HOLD CASH",   "#f8f8f8", "#555")
+        + "</tr></table>"
     )
-    detail_html = "\n".join(
-        "<li>"
-        f"<strong>{row.ticker}/{row.filter_id}</strong>: {row.action}. "
-        f"Price={_format_number(row.signal_price)}, filter={_format_number(row.filter_value)}, "
-        f"distance={_format_pct(row.entry_distance_pct)}, slope={_format_pct(row.filter_slope_pct)}. "
-        f"{row.false_breakout_note}"
-        "</li>"
-        for row in rows
+
+    # ── main signals table ────────────────────────────────────────────────────
+    th_style = "padding:10px;background:#1a1a2e;color:#fff;font-size:0.82em;text-align:left;white-space:nowrap;"
+    signal_rows_html = ""
+    for row in rows:
+        exec_short = row.execution_assets.replace(", ", " · ")
+        signal_rows_html += (
+            "<tr>"
+            f'<td style="padding:10px;font-weight:bold;font-size:1em;">{row.ticker}</td>'
+            f'<td style="padding:10px;">{_action_badge(row.action)}</td>'
+            + _distance_cell(row.entry_distance_pct)
+            + _slope_cell(row.filter_slope_pct)
+            + _fb_warning_cell(row.false_breakout_warning)
+            + f'<td style="padding:10px;font-size:0.78em;color:#444;">{exec_short}</td>'
+            + "</tr>"
+        )
+
+    signals_table = (
+        '<table cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:collapse;">'
+        "<thead><tr>"
+        f'<th style="{th_style}">ETF</th>'
+        f'<th style="{th_style}">Status</th>'
+        f'<th style="{th_style}">Distance from Filter</th>'
+        f'<th style="{th_style}">Trend</th>'
+        f'<th style="{th_style}">Breakout Risk</th>'
+        f'<th style="{th_style}">Execution Assets</th>'
+        "</tr></thead>"
+        f"<tbody>{signal_rows_html}</tbody>"
+        "</table>"
     )
+
+    # ── new entrant guidance cards ────────────────────────────────────────────
     entrant_rows = [r for r in rows if r.new_entrant_tier not in ("N/A", "UNKNOWN", "")]
-    entrant_html = "\n".join(
-        "<tr>"
-        f"<td><strong>{row.ticker}/{row.filter_id}</strong></td>"
-        f"<td>{_tier_badge(row.new_entrant_tier)}</td>"
-        f"<td style='font-size:0.9em'>{row.new_entrant_note}</td>"
-        "</tr>"
-        for row in entrant_rows
-    )
+    entrant_cards_html = ""
+    for row in entrant_rows:
+        tier = row.new_entrant_tier
+        _, border_color = _TIER_BG.get(tier, ("#e2e3e5", "#888"))
+        entrant_cards_html += (
+            f'<div style="border-left:4px solid {border_color};background:#fafafa;'
+            f'padding:12px 14px;margin:8px 0;border-radius:0 6px 6px 0;">'
+            f'<div style="margin-bottom:6px;">'
+            f'<strong style="font-size:0.95em;">{row.ticker}</strong>'
+            f'&nbsp;&nbsp;{_tier_badge(tier)}'
+            f'&nbsp;&nbsp;<span style="font-size:0.78em;color:#888;">{row.filter_id}</span>'
+            f'</div>'
+            f'<div style="font-size:0.83em;color:#444;line-height:1.5;">{row.new_entrant_note}</div>'
+            f'</div>'
+        )
+
     entrant_section = ""
-    if entrant_html:
+    if entrant_cards_html:
         entrant_section = f"""
-  <h3>New Entrant Guidance</h3>
-  <p style="font-size:0.85em;color:#444;">
-    For investors with no existing position.
-    <strong>ENTER</strong> = &gt;3% above filter, slope positive.
-    <strong>CAUTION</strong> = 1.5–3% above filter.
-    <strong>WAIT</strong> = &lt;1.5% above filter (high whipsaw risk at next cross).
-  </p>
-  <table border="1" cellpadding="6" cellspacing="0">
-    <thead>
-      <tr><th>Ticker/Filter</th><th>Tier</th><th>Note</th></tr>
-    </thead>
-    <tbody>{entrant_html}</tbody>
-  </table>"""
+<div style="margin-top:28px;">
+  <div style="font-size:1.05em;font-weight:bold;color:#1a1a2e;border-left:4px solid #1a1a2e;
+      padding-left:10px;margin-bottom:6px;">New Entrant Guide</div>
+  <div style="font-size:0.78em;color:#666;margin-bottom:12px;">
+    For investors with no open position.
+    <strong>ENTER</strong> = price &gt;3% above filter, rising slope — regime is healthy.&nbsp;
+    <strong>CAUTION</strong> = 1.5–3% above filter — moderate cushion.&nbsp;
+    <strong>WAIT</strong> = &lt;1.5% above filter — high false-breakout risk, wait for next clean cross.
+  </div>
+  {entrant_cards_html}
+</div>"""
+
+    # ── footer rules ──────────────────────────────────────────────────────────
+    footer = """
+<div style="margin-top:28px;padding-top:14px;border-top:1px solid #eee;font-size:0.75em;color:#888;line-height:1.8;">
+  <strong>How to read this alert</strong><br>
+  <strong>INVEST ↑</strong> — price just crossed above the moving average filter. Execute at next open.<br>
+  <strong>HOLD LONG ✓</strong> — already above filter. Hold existing position. No action needed.<br>
+  <strong>EXIT ↓</strong> — price just crossed at/below filter. Exit position at next open.<br>
+  <strong>HOLD CASH</strong> — still below filter. Stay in cash.<br>
+  Distance = how far price is above the filter (more = safer).
+  Trend arrow = direction of the moving average itself (↑ rising, → flat, ↓ falling).<br>
+  Breakout risk applies only to fresh INVEST signals and is based on historical whipsaw data.
+</div>"""
 
     return f"""<!doctype html>
 <html>
-<body>
-  <h2>Gayed LRS Market Alert</h2>
-  <p><strong>Market date:</strong> {market_date.isoformat()}<br>
-  <strong>Generated at:</strong> {generated_at_et.isoformat(timespec="seconds")} ET</p>
-  <table border="1" cellpadding="6" cellspacing="0">
-    <thead>
-      <tr>
-        <th>Ticker</th><th>Filter</th><th>Action</th><th>State</th>
-        <th>Signal date</th><th>False-breakout warning</th><th>Execution assets</th>
-      </tr>
-    </thead>
-    <tbody>{row_html}</tbody>
-  </table>
-  <h3>Details</h3>
-  <ul>{detail_html}</ul>
-  <p><em>False-breakout warnings are probabilistic and use historical whipsaw diagnostics.</em></p>
-  {entrant_section}
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+</head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
+    background:#f0f2f5;margin:0;padding:16px;">
+<div style="max-width:680px;margin:0 auto;background:#fff;border-radius:10px;
+    overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,0.08);">
+
+  <!-- header -->
+  <div style="background:#1a1a2e;color:#fff;padding:20px 24px;">
+    <div style="font-size:1.25em;font-weight:bold;">Gayed LRS Market Alert</div>
+    <div style="margin-top:4px;opacity:0.7;font-size:0.82em;">
+      Market date: {market_date.isoformat()} &nbsp;·&nbsp;
+      Generated {generated_at_et.strftime("%H:%M")} ET
+    </div>
+  </div>
+
+  <!-- summary bar -->
+  <div style="padding:16px 24px;background:#f8f9fa;border-bottom:1px solid #eee;">
+    {summary_html}
+  </div>
+
+  <!-- signals table -->
+  <div style="padding:20px 24px;">
+    <div style="font-size:1.0em;font-weight:bold;color:#1a1a2e;
+        border-left:4px solid #1a1a2e;padding-left:10px;margin-bottom:12px;">
+      Today's Signals
+    </div>
+    {signals_table}
+  </div>
+
+  <!-- new entrant section -->
+  <div style="padding:0 24px 24px;">
+    {entrant_section}
+  </div>
+
+  <!-- footer -->
+  <div style="padding:0 24px 24px;">
+    {footer}
+  </div>
+
+</div>
 </body>
 </html>"""
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -236,6 +237,68 @@ def write_data_outputs(
     daily_returns.to_csv(outputs.daily_returns, index=False)
     risk_off_returns.to_csv(outputs.risk_off_returns, index=False)
     quality_report.to_csv(outputs.quality_report, index=False)
+
+
+def run_data_pipeline_incremental(config: dict[str, Any]) -> DataOutputs:
+    """Incremental update: only download data newer than what's already saved.
+
+    Falls back to a full download if no existing raw CSV is found.
+    Uses a 7-day overlap window to capture dividend adjustments and weekend gaps.
+    """
+    raw_path = Path("data/raw/prices_raw.csv")
+    if not raw_path.exists():
+        return run_data_pipeline(config)
+
+    existing_raw = pd.read_csv(raw_path)
+    existing_raw["date"] = pd.to_datetime(existing_raw["date"]).dt.date
+    last_date = existing_raw["date"].max()
+    download_start = last_date - timedelta(days=7)
+
+    data_config = config["data"]
+    tickers = _tickers_from_config(config)
+    end_date = None if data_config["end_date"] == "latest_available" else data_config["end_date"]
+
+    new_raw = download_ohlcv(tickers=tickers, start=str(download_start), end=end_date)
+
+    old_data = existing_raw[existing_raw["date"] < download_start]
+    merged_raw = (
+        pd.concat([old_data, new_raw], ignore_index=True)
+        .sort_values(["ticker", "date"])
+        .drop_duplicates(subset=["ticker", "date"], keep="last")
+        .reset_index(drop=True)
+    )
+
+    adjusted_prices = build_adjusted_prices(merged_raw)
+    daily_returns = build_daily_returns(adjusted_prices)
+    risk_off_returns = build_risk_off_returns(
+        adjusted_prices=adjusted_prices,
+        primary_asset=data_config["risk_off"]["primary_asset"],
+        fallback_asset=data_config["risk_off"]["fallback_asset"],
+        cash_daily_return=float(data_config["risk_off"]["cash_daily_return"]),
+    )
+    quality_report = build_data_quality_report(
+        raw_prices=merged_raw,
+        adjusted_prices=adjusted_prices,
+        tickers=tickers,
+        warmup_bars=int(data_config["warmup_bars"]),
+    )
+
+    outputs = DataOutputs(
+        raw_prices=Path("data/raw/prices_raw.csv"),
+        adjusted_prices=Path("data/processed/prices_adjusted.csv"),
+        daily_returns=Path("data/processed/returns_daily.csv"),
+        risk_off_returns=Path("data/processed/risk_off_returns.csv"),
+        quality_report=Path("data/processed/data_quality_report.csv"),
+    )
+    write_data_outputs(
+        outputs=outputs,
+        raw_prices=merged_raw,
+        adjusted_prices=adjusted_prices,
+        daily_returns=daily_returns,
+        risk_off_returns=risk_off_returns,
+        quality_report=quality_report,
+    )
+    return outputs
 
 
 def _tickers_from_config(config: dict[str, Any]) -> list[str]:

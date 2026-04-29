@@ -145,15 +145,6 @@ strategy:
     - id: SMA_200
       type: SMA
       length: 200
-    - id: EMA_190
-      type: EMA
-      length: 190
-    - id: EMA_195
-      type: EMA
-      length: 195
-    - id: EMA_200
-      type: EMA
-      length: 200
 
   sensitivity_filters:
     type: EMA

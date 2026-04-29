@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python scripts/export_pdf.py)",
+      "Bash(pip install *)",
+      "Bash(open *)"
+    ]
+  }
+}

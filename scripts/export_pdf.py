@@ -1,13 +1,17 @@
-"""Generate the final strategy review PDF with embedded charts.
+"""Generate the Gayed LRS personal trade review PDF.
 
-Charts generated:
-  1. SPY — Strategy (SMA 200) vs Buy-and-Hold equity curve
-  2. SPY — Drawdown comparison over time (strategy vs buy-and-hold)
-  3. UPRO 3x — Strategy (SMA 200) vs Buy-and-Hold equity curve
-  4. UPRO 3x — Drawdown comparison over time
-  5. TQQQ 3x — Strategy (EMA 200) vs Buy-and-Hold equity curve
-  6. EMA Sensitivity — Calmar ratio by EMA length (SPY and QQQ)
+Charts produced:
+  A. SPY Regime Map        — SPY price vs SMA-200 with LONG/RISK-OFF background shading
+  B. Growth of $10,000     — SPY B&H, SPY Strategy, UPRO B&H, UPRO Strategy (log)
+  C. Drawdown Comparison   — Strategy vs Buy-and-Hold for SPY and UPRO
+  D. Volatility Regime     — Annualized vol above vs below SMA (replicates paper Chart 1)
+  E. Return Regime         — Annualized return above vs below SMA (replicates paper Chart 3)
+  F. Rolling 3Y Performance— Rolling 3-year CAGR: Strategy vs B&H (replicates paper Chart 9)
+  G. Calendar Year Returns — Annual bar chart: Strategy vs Buy-and-Hold
+
+Metrics table: paper Table 8 numbers side-by-side with my backtest results.
 """
+from __future__ import annotations
 
 import base64
 import io
@@ -18,6 +22,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import matplotlib.ticker as mticker
+import matplotlib.patches as mpatches
 import numpy as np
 import pandas as pd
 
@@ -28,168 +34,563 @@ except ImportError as e:
     print(f"Missing dependency: {e}")
     sys.exit(1)
 
-REPORT_MD  = Path("reports/final_strategy_review.md")
-REPORT_PDF = Path("reports/final_strategy_review.pdf")
-EQUITY_CSV = Path("outputs/backtests/fixed_rule_equity_curves.csv")
-SENS_CSV   = Path("reports/tables/parameter_sensitivity.csv")
+# ── file paths ────────────────────────────────────────────────────────────────
+EQUITY_CSV  = Path("outputs/backtests/fixed_rule_equity_curves.csv")
+METRICS_CSV = Path("reports/tables/fixed_rule_metrics.csv")
+PRICES_CSV  = Path("data/processed/prices_adjusted.csv")
+REPORT_PDF  = Path("reports/gayed_lrs_review.pdf")
 
-# ─── colour palette ────────────────────────────────────────────────────────────
+TRADING_DAYS = 252
+
+# ── colour palette ────────────────────────────────────────────────────────────
 BLUE    = "#2563eb"
+NAVY    = "#1e3a8a"
+ORANGE  = "#f97316"
+GREEN   = "#16a34a"
+RED     = "#dc2626"
 GRAY    = "#94a3b8"
-RED     = "#ef4444"
-RED_LT  = "#fca5a5"
 BG      = "#f8fafc"
 GRID    = "#e2e8f0"
+GREEN_L = "#bbf7d0"
+RED_L   = "#fecaca"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Chart helpers
+# Data helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _to_b64(fig: plt.Figure) -> str:
+def load_equity_curves(filter_id: str = "SMA_200") -> pd.DataFrame:
+    chunks = []
+    for chunk in pd.read_csv(
+        EQUITY_CSV, chunksize=200_000, parse_dates=["date"],
+        usecols=["date", "signal_ticker", "filter_id", "execution_id",
+                 "result_type", "daily_return", "equity"],
+    ):
+        rows = chunk[chunk["filter_id"] == filter_id]
+        if not rows.empty:
+            chunks.append(rows)
+    if not chunks:
+        raise ValueError(f"No equity data found for filter_id={filter_id}")
+    return pd.concat(chunks, ignore_index=True).sort_values(
+        ["signal_ticker", "execution_id", "result_type", "date"]
+    ).reset_index(drop=True)
+
+
+def get_combo(df: pd.DataFrame, signal_ticker: str, execution_id: str,
+              result_type: str) -> pd.DataFrame:
+    mask = (
+        (df["signal_ticker"] == signal_ticker)
+        & (df["execution_id"] == execution_id)
+        & (df["result_type"] == result_type)
+    )
+    return df[mask].reset_index(drop=True)
+
+
+def load_spy_prices() -> pd.DataFrame:
+    df = pd.read_csv(PRICES_CSV, parse_dates=["date"])
+    spy = df[df["ticker"] == "SPY"][["date", "adjusted_close"]].dropna()
+    return spy.sort_values("date").reset_index(drop=True)
+
+
+def load_metrics(filter_id: str = "SMA_200") -> pd.DataFrame:
+    df = pd.read_csv(METRICS_CSV)
+    return df[df["filter_id"] == filter_id].reset_index(drop=True)
+
+
+def normalize(equity: pd.Series, start: float = 10_000.0) -> pd.Series:
+    return equity / equity.iloc[0] * start
+
+
+def drawdown_series(equity: pd.Series) -> pd.Series:
+    return equity / equity.cummax() - 1.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Chart utilities
+# ══════════════════════════════════════════════════════════════════════════════
+
+def to_b64(fig: plt.Figure) -> str:
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight",
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
     plt.close(fig)
     buf.seek(0)
     return base64.b64encode(buf.read()).decode()
 
 
-def _load_equity_slice(
-    signal_ticker: str,
-    filter_id: str,
-    execution_id: str,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Return (strategy_df, buyhold_df) for the requested combo."""
-    chunks = []
-    for chunk in pd.read_csv(EQUITY_CSV, chunksize=200_000,
-                              parse_dates=["date"],
-                              usecols=["date", "signal_ticker", "filter_id",
-                                       "execution_id", "result_type",
-                                       "equity", "daily_return"]):
-        rows = chunk[
-            (chunk["signal_ticker"] == signal_ticker)
-            & (chunk["filter_id"] == filter_id)
-            & (chunk["execution_id"] == execution_id)
-        ]
-        if not rows.empty:
-            chunks.append(rows)
-
-    if not chunks:
-        raise ValueError(f"No equity data for {signal_ticker}/{filter_id}/{execution_id}")
-
-    df = pd.concat(chunks).sort_values("date")
-    strat = df[df["result_type"] == "strategy"].reset_index(drop=True)
-    bh    = df[df["result_type"] == "buy_hold"].reset_index(drop=True)
-    return strat, bh
-
-
-def _drawdown_series(equity: pd.Series) -> pd.Series:
-    return equity / equity.cummax() - 1.0
-
-
-def _style_axes(ax, title: str) -> None:
+def style_ax(ax: plt.Axes, title: str) -> None:
     ax.set_facecolor(BG)
-    ax.grid(True, color=GRID, linewidth=0.6, linestyle="-")
-    ax.set_title(title, fontsize=10, fontweight="bold", color="#0f172a", pad=8)
+    ax.grid(True, color=GRID, linewidth=0.6)
+    ax.set_title(title, fontsize=9.5, fontweight="bold", color="#0f172a", pad=8)
     ax.tick_params(labelsize=7.5, colors="#475569")
     for spine in ax.spines.values():
         spine.set_edgecolor(GRID)
+
+
+def fmt_year(ax: plt.Axes, step: int = 4) -> None:
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    ax.xaxis.set_major_locator(mdates.YearLocator(5))
-    plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha="right")
+    ax.xaxis.set_major_locator(mdates.YearLocator(step))
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=35, ha="right")
 
 
-# ─── Chart 1 & 2 : equity curve + drawdown for any combo ──────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Chart A — SPY Regime Map
+# ══════════════════════════════════════════════════════════════════════════════
 
-def chart_equity_and_drawdown(
-    signal_ticker: str,
-    filter_id: str,
-    execution_id: str,
-    title: str,
-    subtitle_strat: str = "Strategy",
-    subtitle_bh: str = "Buy and Hold",
-    log_scale: bool = True,
-) -> str:
-    strat, bh = _load_equity_slice(signal_ticker, filter_id, execution_id)
-    start_val = 100_000.0
-    s_eq = strat["equity"].values
-    b_eq = bh["equity"].values
-    s_norm = s_eq / s_eq[0] * start_val
-    b_norm = b_eq / b_eq[0] * start_val
+def chart_regime_map(prices: pd.DataFrame) -> str:
+    close = prices["adjusted_close"]
+    dates = pd.to_datetime(prices["date"])
+    sma200 = close.rolling(200, min_periods=200).mean()
 
-    s_dd = _drawdown_series(pd.Series(s_norm))
-    b_dd = _drawdown_series(pd.Series(b_norm))
-    dates = strat["date"].values
+    fig, ax = plt.subplots(figsize=(10.5, 4.2), facecolor="white")
 
-    fig, axes = plt.subplots(2, 1, figsize=(8.5, 5.2),
-                             gridspec_kw={"height_ratios": [3, 1.5], "hspace": 0.35},
-                             facecolor="white")
+    # Shade LONG (green) and RISK-OFF (red) regions using xaxis transform
+    valid = sma200.notna()
+    above = (close > sma200) & valid
+    below = (~above) & valid
 
-    # ── top: equity curve ────────────────────────────────────────────────────
-    ax = axes[0]
-    ax.plot(dates, b_norm, color=GRAY, linewidth=1.2, label=subtitle_bh, alpha=0.85)
-    ax.plot(dates, s_norm, color=BLUE, linewidth=1.6, label=subtitle_strat)
-    if log_scale:
-        ax.set_yscale("log")
-        ax.yaxis.set_major_formatter(
-            matplotlib.ticker.FuncFormatter(lambda x, _: f"${x/1000:.0f}k" if x >= 1000 else f"${x:.0f}")
-        )
-    else:
-        ax.yaxis.set_major_formatter(
-            matplotlib.ticker.FuncFormatter(lambda x, _: f"${x/1000:.0f}k")
-        )
-    ax.legend(fontsize=8, framealpha=0.9, loc="upper left")
-    ax.set_ylabel("Portfolio value (log)", fontsize=8, color="#475569")
-    _style_axes(ax, f"{title} — Equity Curve")
+    ax.fill_between(dates, 0, 1,
+                    where=above.values, transform=ax.get_xaxis_transform(),
+                    color=GREEN_L, alpha=0.5, linewidth=0, label="_nolegend_")
+    ax.fill_between(dates, 0, 1,
+                    where=below.values, transform=ax.get_xaxis_transform(),
+                    color=RED_L, alpha=0.5, linewidth=0, label="_nolegend_")
 
-    # ── bottom: drawdown ─────────────────────────────────────────────────────
+    ax.plot(dates, close, color=GRAY, linewidth=0.8, alpha=0.85, label="SPY Close")
+    ax.plot(dates, sma200, color=BLUE, linewidth=1.6, label="SMA 200")
+
+    ax.set_yscale("log")
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(
+        lambda x, _: f"${x:.0f}" if x < 100 else f"${x:.0f}"
+    ))
+    ax.set_ylabel("SPY Price (log scale)", fontsize=8, color="#475569")
+
+    legend_handles = [
+        ax.lines[0], ax.lines[1],
+        mpatches.Patch(facecolor=GREEN_L, alpha=0.7, label="LONG — SPY above SMA 200"),
+        mpatches.Patch(facecolor=RED_L,   alpha=0.7, label="RISK-OFF — SPY at/below SMA 200"),
+    ]
+    ax.legend(handles=legend_handles, fontsize=8, framealpha=0.9, loc="upper left", ncol=2)
+    style_ax(ax, "Chart A — SPY Price vs SMA-200 Regime Map  |  Green = Long leveraged ETF  ·  Red = Cash")
+    fmt_year(ax)
+    fig.tight_layout()
+    return to_b64(fig)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Chart B — Growth of $10,000
+# ══════════════════════════════════════════════════════════════════════════════
+
+def chart_growth(df: pd.DataFrame) -> str:
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.5), facecolor="white")
+
+    # Left: SPY 1x
+    ax1 = axes[0]
+    for eid, rt, color, lw, label in [
+        ("SPY_1X", "strategy", BLUE, 1.8, "SPY Strategy (SMA 200 → Cash)"),
+        ("SPY_1X", "buy_hold", GRAY, 1.2, "SPY Buy & Hold"),
+    ]:
+        combo = get_combo(df, "SPY", eid, rt)
+        if combo.empty:
+            continue
+        eq = normalize(combo["equity"])
+        ax1.plot(pd.to_datetime(combo["date"]), eq, color=color, linewidth=lw, label=label)
+    ax1.yaxis.set_major_formatter(mticker.FuncFormatter(
+        lambda x, _: f"${x/1000:.0f}k" if x >= 1000 else f"${x:.0f}"
+    ))
+    ax1.legend(fontsize=8, framealpha=0.9, loc="upper left")
+    ax1.set_ylabel("Portfolio Value (start $10,000)", fontsize=8, color="#475569")
+    style_ax(ax1, "Chart B1 — SPY 1x: Strategy vs Buy-and-Hold  (1993–2026)")
+    fmt_year(ax1)
+
+    # Right: UPRO 3x log
     ax2 = axes[1]
-    ax2.fill_between(dates, b_dd * 100, 0, color=RED_LT, alpha=0.6, label=subtitle_bh)
-    ax2.fill_between(dates, s_dd * 100, 0, color=RED, alpha=0.7, label=subtitle_strat)
-    ax2.set_ylabel("Drawdown (%)", fontsize=8, color="#475569")
-    ax2.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda x, _: f"{x:.0f}%"))
-    ax2.legend(fontsize=8, framealpha=0.9, loc="lower left")
-    _style_axes(ax2, "Drawdown from Peak")
+    for eid, rt, color, lw, label in [
+        ("UPRO_3X", "strategy", NAVY,   1.8, "UPRO 3x Strategy (SMA 200 → Cash)"),
+        ("UPRO_3X", "buy_hold", ORANGE, 1.2, "UPRO 3x Buy & Hold"),
+    ]:
+        combo = get_combo(df, "SPY", eid, rt)
+        if combo.empty:
+            continue
+        eq = normalize(combo["equity"])
+        ax2.plot(pd.to_datetime(combo["date"]), eq, color=color, linewidth=lw, label=label)
+    ax2.set_yscale("log")
+    ax2.yaxis.set_major_formatter(mticker.FuncFormatter(
+        lambda x, _: f"${x/1000:.0f}k" if x >= 1000 else f"${x:.0f}"
+    ))
+    ax2.legend(fontsize=8, framealpha=0.9, loc="upper left")
+    ax2.set_ylabel("Portfolio Value, log scale", fontsize=8, color="#475569")
+    style_ax(ax2, "Chart B2 — UPRO 3x: Strategy vs Buy-and-Hold  (2009–2026, log)")
+    fmt_year(ax2, step=3)
 
-    return _to_b64(fig)
+    fig.tight_layout(pad=2.5)
+    return to_b64(fig)
 
 
-# ─── Chart 3 : EMA sensitivity ────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Chart C — Drawdown
+# ══════════════════════════════════════════════════════════════════════════════
 
-def chart_ema_sensitivity() -> str:
-    sens = pd.read_csv(SENS_CSV)
-    ema_only = sens[sens["filter_id"].str.startswith("EMA")].copy()
-    ema_only["length"] = ema_only["filter_id"].str.replace("EMA_", "").astype(int)
+def chart_drawdown(df: pd.DataFrame) -> str:
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.5), facecolor="white")
 
-    colours = {
-        "SPY": "#2563eb",
-        "QQQ": "#7c3aed",
-        "IWM": "#16a34a",
-        "VGK": "#ea580c",
-        "EZU": "#db2777",
-    }
+    panels = [
+        ("SPY",  "SPY_1X",  "Chart C1 — SPY 1x: Drawdown from Peak"),
+        ("SPY",  "UPRO_3X", "Chart C2 — UPRO 3x: Drawdown from Peak"),
+    ]
+    strat_colors = [BLUE, NAVY]
+    bh_colors    = [GRAY, ORANGE]
 
-    fig, ax = plt.subplots(figsize=(8.5, 3.8), facecolor="white")
-    for ticker, grp in ema_only.groupby("signal_ticker"):
-        g = grp.sort_values("length")
-        ax.plot(g["length"], g["calmar_ratio"],
-                marker="o", markersize=4,
-                color=colours.get(ticker, "#64748b"),
-                linewidth=1.5, label=ticker)
+    for ax, (sig, eid, title), sc, bc in zip(axes, panels, strat_colors, bh_colors):
+        strat = get_combo(df, sig, eid, "strategy")
+        bh    = get_combo(df, sig, eid, "buy_hold")
+        for data, color, label in [(bh, bc, "Buy & Hold"), (strat, sc, "Strategy")]:
+            if data.empty:
+                continue
+            dd = drawdown_series(data["equity"]) * 100
+            ax.fill_between(pd.to_datetime(data["date"]), dd, 0,
+                            color=color, alpha=0.3, label=label)
+            ax.plot(pd.to_datetime(data["date"]), dd, color=color, linewidth=0.8)
+        ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:.0f}%"))
+        ax.legend(fontsize=8, framealpha=0.9, loc="lower left")
+        ax.set_ylabel("Drawdown (%)", fontsize=8, color="#475569")
+        style_ax(ax, title)
+        fmt_year(ax, step=4 if sig == "SPY" else 3)
 
-    ax.set_xlabel("EMA Length", fontsize=8.5, color="#475569")
-    ax.set_ylabel("Calmar Ratio", fontsize=8.5, color="#475569")
-    ax.set_facecolor(BG)
-    ax.grid(True, color=GRID, linewidth=0.6)
-    ax.set_title("EMA Sensitivity — Calmar Ratio by EMA Length (all ETFs)",
-                 fontsize=10, fontweight="bold", color="#0f172a", pad=8)
-    ax.legend(fontsize=8.5, framealpha=0.9)
-    ax.tick_params(labelsize=8, colors="#475569")
-    for spine in ax.spines.values():
-        spine.set_edgecolor(GRID)
+    fig.tight_layout(pad=2.5)
+    return to_b64(fig)
 
-    return _to_b64(fig)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Charts D & E — Regime volatility and return (replicate paper Charts 1 & 3)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _regime_stats(prices: pd.DataFrame) -> dict[int, dict]:
+    close = prices["adjusted_close"].reset_index(drop=True)
+    daily_ret = close.pct_change().dropna()
+    close_aligned = close.loc[daily_ret.index]
+
+    windows = [10, 20, 50, 100, 200]
+    stats: dict[int, dict] = {}
+    for w in windows:
+        sma = close.rolling(w, min_periods=w).mean()
+        sma_aligned = sma.loc[daily_ret.index]
+        valid = sma_aligned.notna()
+        above = (close_aligned > sma_aligned) & valid
+        below = (~above) & valid
+
+        r_above = daily_ret[above]
+        r_below = daily_ret[below]
+
+        vol_above = r_above.std(ddof=0) * np.sqrt(TRADING_DAYS) if len(r_above) > 1 else np.nan
+        vol_below = r_below.std(ddof=0) * np.sqrt(TRADING_DAYS) if len(r_below) > 1 else np.nan
+        ret_above = (1 + r_above).prod() ** (TRADING_DAYS / max(len(r_above), 1)) - 1
+        ret_below = (1 + r_below).prod() ** (TRADING_DAYS / max(len(r_below), 1)) - 1
+        pct_above = above.sum() / valid.sum() if valid.sum() > 0 else np.nan
+
+        stats[w] = dict(vol_above=vol_above, vol_below=vol_below,
+                        ret_above=ret_above, ret_below=ret_below,
+                        pct_above=pct_above)
+    return stats
+
+
+def chart_vol_regime(prices: pd.DataFrame) -> str:
+    stats = _regime_stats(prices)
+    windows = [10, 20, 50, 100, 200]
+    labels = [f"{w}-day" for w in windows]
+    v_above = [stats[w]["vol_above"] * 100 for w in windows]
+    v_below = [stats[w]["vol_below"] * 100 for w in windows]
+
+    x = np.arange(len(windows))
+    width = 0.35
+    fig, ax = plt.subplots(figsize=(8.5, 4.2), facecolor="white")
+    b1 = ax.bar(x - width/2, v_above, width, color=BLUE,   alpha=0.85, label="Volatility Above SMA")
+    b2 = ax.bar(x + width/2, v_below, width, color=ORANGE, alpha=0.85, label="Volatility Below SMA")
+    for bar in b1:
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                f"{bar.get_height():.1f}%", ha="center", va="bottom", fontsize=8, color=BLUE)
+    for bar in b2:
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                f"{bar.get_height():.1f}%", ha="center", va="bottom", fontsize=8, color=ORANGE)
+    ax.set_xticks(x); ax.set_xticklabels(labels)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:.0f}%"))
+    ax.legend(fontsize=9, framealpha=0.9)
+    ax.set_ylabel("Annualized Volatility", fontsize=8.5, color="#475569")
+    style_ax(ax, (
+        "Chart D — SPY Annualized Volatility Above vs Below Moving Averages  (1993–Present)\n"
+        "Paper (1928–2015): 14.7% above vs 26.5% below for the 200-day SMA"
+    ))
+    fig.tight_layout()
+    return to_b64(fig)
+
+
+def chart_return_regime(prices: pd.DataFrame) -> str:
+    stats = _regime_stats(prices)
+    windows = [10, 20, 50, 100, 200]
+    labels = [f"{w}-day" for w in windows]
+    r_above = [stats[w]["ret_above"] * 100 for w in windows]
+    r_below = [stats[w]["ret_below"] * 100 for w in windows]
+
+    x = np.arange(len(windows))
+    width = 0.35
+    fig, ax = plt.subplots(figsize=(8.5, 4.2), facecolor="white")
+    b1 = ax.bar(x - width/2, r_above, width, color=BLUE,   alpha=0.85, label="Return Above SMA")
+    b2 = ax.bar(x + width/2, r_below, width, color=ORANGE, alpha=0.85, label="Return Below SMA")
+    for bar in (list(b1) + list(b2)):
+        v = bar.get_height()
+        offset = 0.4 if v >= 0 else -1.8
+        ax.text(bar.get_x() + bar.get_width()/2, v + offset,
+                f"{v:.1f}%", ha="center", va="bottom", fontsize=8,
+                color=BLUE if bar in b1 else ORANGE)
+    ax.axhline(0, color="#475569", linewidth=0.8, linestyle="--")
+    ax.set_xticks(x); ax.set_xticklabels(labels)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:.0f}%"))
+    ax.legend(fontsize=9, framealpha=0.9)
+    ax.set_ylabel("Annualized Return", fontsize=8.5, color="#475569")
+    style_ax(ax, (
+        "Chart E — SPY Annualized Return Above vs Below Moving Averages  (1993–Present)\n"
+        "Paper (1928–2015): +14.1% above vs −2.3% below for the 200-day SMA"
+    ))
+    fig.tight_layout()
+    return to_b64(fig)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Chart F — Rolling 3-Year Outperformance
+# ══════════════════════════════════════════════════════════════════════════════
+
+def chart_rolling_outperformance(df: pd.DataFrame) -> str:
+    window = 3 * TRADING_DAYS
+
+    combos = [
+        ("SPY", "SPY_1X",  BLUE,   "SPY 1x LRS"),
+        ("SPY", "SSO_2X",  GREEN,  "SPY→SSO 2x LRS"),
+        ("SPY", "UPRO_3X", NAVY,   "SPY→UPRO 3x LRS"),
+    ]
+
+    fig, ax = plt.subplots(figsize=(10.5, 4.2), facecolor="white")
+
+    for sig, eid, color, label in combos:
+        strat = get_combo(df, sig, eid, "strategy")
+        bh    = get_combo(df, sig, eid, "buy_hold")
+        if strat.empty or bh.empty:
+            continue
+
+        merged = pd.merge(
+            strat[["date", "daily_return"]].rename(columns={"daily_return": "s"}),
+            bh[["date", "daily_return"]].rename(columns={"daily_return": "b"}),
+            on="date", how="inner",
+        ).sort_values("date").reset_index(drop=True)
+
+        # Rolling CAGR using cumulative product ratio
+        cum_s = (1 + merged["s"]).cumprod()
+        cum_b = (1 + merged["b"]).cumprod()
+        # ratio of trailing window
+        roll_s = cum_s / cum_s.shift(window).bfill()
+        roll_b = cum_b / cum_b.shift(window).bfill()
+        ann_s = roll_s ** (TRADING_DAYS / window) - 1
+        ann_b = roll_b ** (TRADING_DAYS / window) - 1
+        excess = (ann_s - ann_b) * 100
+
+        dates = pd.to_datetime(merged["date"])
+        ax.plot(dates, excess, color=color, linewidth=1.2, label=label, alpha=0.85)
+
+    ax.axhline(0, color=RED, linewidth=1.0, linestyle="--", alpha=0.6, label="Zero line")
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:.0f}%"))
+    ax.legend(fontsize=8, framealpha=0.9, loc="upper right")
+    ax.set_ylabel("Rolling 3Y Outperformance vs B&H (annualised)", fontsize=8, color="#475569")
+    style_ax(ax, (
+        "Chart F — Rolling 3-Year Outperformance: LRS vs Buy-and-Hold\n"
+        "Positive = strategy ahead of B&H. Replicates paper Chart 9."
+    ))
+    fmt_year(ax)
+    fig.tight_layout()
+    return to_b64(fig)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Chart G — Calendar Year Returns
+# ══════════════════════════════════════════════════════════════════════════════
+
+def chart_calendar_year(df: pd.DataFrame) -> str:
+    pairs = [
+        ("SPY", "SPY_1X",  "Chart G1 — SPY 1x: Calendar Year Returns"),
+        ("SPY", "UPRO_3X", "Chart G2 — UPRO 3x: Calendar Year Returns"),
+    ]
+    fig, axes = plt.subplots(2, 1, figsize=(10.5, 6.5), facecolor="white")
+
+    for ax, (sig, eid, title) in zip(axes, pairs):
+        strat = get_combo(df, sig, eid, "strategy")
+        bh    = get_combo(df, sig, eid, "buy_hold")
+        if strat.empty or bh.empty:
+            continue
+
+        def annual(data: pd.DataFrame) -> pd.Series:
+            d = data.copy()
+            d["year"] = pd.to_datetime(d["date"]).dt.year
+            return d.groupby("year")["daily_return"].apply(
+                lambda r: (1 + r).prod() - 1
+            ) * 100
+
+        strat_yr = annual(strat)
+        bh_yr    = annual(bh)
+        years = sorted(set(strat_yr.index) & set(bh_yr.index))
+
+        s_vals = [strat_yr.get(y, np.nan) for y in years]
+        b_vals = [bh_yr.get(y, np.nan) for y in years]
+
+        x = np.arange(len(years))
+        w = 0.38
+        ax.bar(x - w/2, s_vals, w, color=BLUE,   alpha=0.85, label="Strategy")
+        ax.bar(x + w/2, b_vals, w, color=GRAY,   alpha=0.75, label="Buy & Hold")
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(years, rotation=45, ha="right", fontsize=6.5)
+        ax.axhline(0, color="#475569", linewidth=0.6)
+        ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:.0f}%"))
+        ax.legend(fontsize=8, framealpha=0.9, loc="upper left")
+        ax.set_ylabel("Annual Return (%)", fontsize=8, color="#475569")
+        style_ax(ax, title)
+
+    fig.tight_layout(pad=2.5)
+    return to_b64(fig)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Metrics comparison table HTML
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Paper Table 8 — 200-day LRS, Oct 1928 – Oct 2015 (synthetic leverage, 1% annual fee)
+_PAPER = [
+    ("S&P 500 Buy & Hold",  "9.1%",  "18.9%", "0.30", "0.43", "−86.2%", "~0"),
+    ("S&P 1.25x LRS",       "12.5%", "15.5%", "0.53", "0.83", "−59.0%", "~5"),
+    ("S&P 2x LRS",          "19.1%", "24.9%", "0.51", "0.90", "−78.7%", "~5"),
+    ("S&P 3x LRS",          "26.8%", "37.3%", "0.47", "0.90", "−92.2%", "~5"),
+]
+
+
+def _pct(v) -> str:
+    return "—" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v*100:.1f}%"
+
+def _num(v, d: int = 2) -> str:
+    return "—" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v:.{d}f}"
+
+
+def build_metrics_table(metrics: pd.DataFrame) -> str:
+    wanted = [
+        ("SPY", "SPY_1X",  "strategy", "SPY 1x Strategy",    "1993–2026"),
+        ("SPY", "SPY_1X",  "buy_hold", "SPY 1x Buy & Hold",  "1993–2026"),
+        ("SPY", "SSO_2X",  "strategy", "SPY→SSO 2x Strategy","2006–2026"),
+        ("SPY", "SSO_2X",  "buy_hold", "SSO 2x Buy & Hold",  "2006–2026"),
+        ("SPY", "UPRO_3X", "strategy", "SPY→UPRO 3x Strategy","2009–2026"),
+        ("SPY", "UPRO_3X", "buy_hold", "UPRO 3x Buy & Hold", "2009–2026"),
+    ]
+
+    def row_class(result_type: str) -> str:
+        return ' style="background:#eff6ff;"' if result_type == "strategy" else ""
+
+    paper_rows = "\n".join(
+        f'<tr><td>{n}</td><td>{c}</td><td>{v}</td><td>{sh}</td>'
+        f'<td>{so}</td><td>{md}</td><td>{tr}</td><td style="font-size:8pt;color:#64748b">1928–2015</td></tr>'
+        for n, c, v, sh, so, md, tr in _PAPER
+    )
+
+    my_rows = ""
+    for sig, eid, rt, label, period in wanted:
+        row = metrics[
+            (metrics["signal_ticker"] == sig)
+            & (metrics["execution_id"] == eid)
+            & (metrics["result_type"] == rt)
+        ]
+        rc = row_class(rt)
+        if row.empty:
+            my_rows += f'<tr{rc}><td>{label}</td><td colspan="6" style="color:#94a3b8">No data — re-run backtest</td><td style="font-size:8pt;color:#64748b">{period}</td></tr>\n'
+            continue
+        r = row.iloc[0]
+        s_date = str(r.get("start_date", ""))[:10]
+        e_date = str(r.get("end_date",   ""))[:10]
+        my_rows += (
+            f'<tr{rc}>'
+            f'<td>{label}</td>'
+            f'<td>{_pct(r.get("CAGR"))}</td>'
+            f'<td>{_pct(r.get("annualized_volatility"))}</td>'
+            f'<td>{_num(r.get("sharpe_ratio"))}</td>'
+            f'<td>{_num(r.get("sortino_ratio"))}</td>'
+            f'<td>{_pct(r.get("max_drawdown"))}</td>'
+            f'<td>{_num(r.get("trades_per_year"), 1)}</td>'
+            f'<td style="font-size:8pt;color:#64748b">{s_date} → {e_date}</td>'
+            f'</tr>\n'
+        )
+
+    return f"""
+<table>
+<thead>
+<tr>
+  <th>Strategy</th><th>CAGR</th><th>Ann. Vol</th><th>Sharpe</th>
+  <th>Sortino</th><th>Max DD</th><th>Trades/Yr</th><th>Period</th>
+</tr>
+</thead>
+<tbody>
+<tr style="background:#1e3a8a;color:white;">
+  <td colspan="8"><strong>Paper Results — Gayed &amp; Bilello (2016), S&amp;P 500 synthetic leverage,
+  Oct 1928–Oct 2015, 1% annual leverage fee, risk-off = T-bills</strong></td>
+</tr>
+{paper_rows}
+<tr style="background:#166534;color:white;">
+  <td colspan="8"><strong>My Backtest — SPY/SSO/UPRO ETFs, SMA-200 signal, risk-off = 0% cash,
+  costs = 2 bps slippage+spread per side</strong></td>
+</tr>
+{my_rows}
+</tbody>
+</table>
+<p style="font-size:8.5pt;color:#64748b;margin-top:6px;">
+<strong>Period difference:</strong> paper runs from 1928; my data starts at SPY inception (Jan 1993).
+SSO launched Jun 2006, UPRO launched Jun 2009. Shorter periods explain lower absolute returns on
+leveraged ETF strategies. Sharpe is shown without risk-free rate deduction in both paper and my backtest.
+Risk-off = 0% cash in my backtest vs T-bills in the paper — underestimates strategy return during
+high-rate periods (e.g. 2022–2024).
+</p>
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Report markdown body
+# ══════════════════════════════════════════════════════════════════════════════
+
+REPORT_MD = """# Gayed-Bilello Leverage Rotation Strategy — Personal Trade Review
+
+**Reference:** *Leverage for the Long Run* — Michael A. Gayed CFA & Charlie Bilello CMT, 2016 Charles H. Dow Award
+
+---
+
+## The Rule (Exact Paper Definition)
+
+> When the S&P 500 Index closes **above** its 200-day Simple Moving Average → go **long** the leveraged ETF.
+>
+> When the S&P 500 Index closes **at or below** its 200-day Simple Moving Average → rotate into **Treasury bills**.
+
+- Signal: confirmed at end-of-day close using `adjusted_close`
+- Execution: next session open (no same-day lookahead)
+- Filter: SMA, not EMA. Length: 200 calendar days
+- Risk-off: paper uses T-bills; this backtest uses 0% cash (conservative)
+
+---
+
+## How to Read the Signal (Live Use)
+
+| Condition | Action |
+|---|---|
+| SPY close > SMA-200 and you are in cash | **Buy** leveraged ETF at next open |
+| SPY close ≤ SMA-200 and you hold the ETF | **Sell** leveraged ETF at next open, move to cash |
+| No change | Hold current position |
+
+Check the signal each day after market close. Act at the following morning's open.
+
+---
+
+## Metrics Comparison — Paper vs My Backtest
+
+"""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -198,126 +599,121 @@ def chart_ema_sensitivity() -> str:
 
 CSS = """
 @page {
-    size: A4;
-    margin: 2.2cm 2.5cm 2.2cm 2.5cm;
-    @bottom-right {
-        content: "Page " counter(page) " of " counter(pages);
-        font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
-        font-size: 9pt;
-        color: #94a3b8;
-    }
+  size: A4;
+  margin: 2cm 2.2cm 2cm 2.2cm;
+  @bottom-right {
+    content: "Page " counter(page) " of " counter(pages);
+    font-family: 'Helvetica Neue', Arial, sans-serif;
+    font-size: 8.5pt;
+    color: #94a3b8;
+  }
 }
 
 * { box-sizing: border-box; }
 
 body {
-    font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
-    font-size: 10.5pt;
-    line-height: 1.72;
-    color: #1e293b;
+  font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  font-size: 10pt;
+  line-height: 1.70;
+  color: #1e293b;
 }
 
 h1 {
-    font-size: 21pt;
-    font-weight: 700;
-    color: #0f172a;
-    border-bottom: 3px solid #2563eb;
-    padding-bottom: 10px;
-    margin-top: 0;
-    margin-bottom: 4px;
+  font-size: 19pt;
+  font-weight: 700;
+  color: #0f172a;
+  border-bottom: 3px solid #2563eb;
+  padding-bottom: 9px;
+  margin-top: 0;
+  margin-bottom: 6px;
 }
 
 h2 {
-    font-size: 13.5pt;
-    font-weight: 700;
-    color: #1e40af;
-    margin-top: 30px;
-    margin-bottom: 6px;
-    border-left: 4px solid #2563eb;
-    padding-left: 10px;
-    page-break-after: avoid;
+  font-size: 13pt;
+  font-weight: 700;
+  color: #1e40af;
+  border-left: 4px solid #2563eb;
+  padding-left: 10px;
+  margin-top: 26px;
+  margin-bottom: 6px;
+  page-break-after: avoid;
 }
 
 h3 {
-    font-size: 11pt;
-    font-weight: 600;
-    color: #334155;
-    margin-top: 18px;
-    margin-bottom: 4px;
-    page-break-after: avoid;
+  font-size: 10.5pt;
+  font-weight: 600;
+  color: #334155;
+  margin-top: 16px;
+  margin-bottom: 4px;
+  page-break-after: avoid;
 }
 
-p { margin: 0 0 9px 0; text-align: justify; }
+p { margin: 0 0 8px 0; text-align: justify; }
+
+blockquote {
+  margin: 10px 0;
+  padding: 8px 16px;
+  border-left: 4px solid #2563eb;
+  background: #eff6ff;
+  font-style: italic;
+  color: #1e40af;
+}
 
 table {
-    width: 100%;
-    border-collapse: collapse;
-    margin: 12px 0 16px 0;
-    font-size: 9pt;
-    page-break-inside: avoid;
+  width: 100%;
+  border-collapse: collapse;
+  margin: 10px 0 14px 0;
+  font-size: 8.5pt;
+  page-break-inside: avoid;
 }
 
-thead tr { background-color: #1e40af; color: #ffffff; }
-thead th { padding: 7px 9px; text-align: left; font-weight: 600; }
-tbody tr:nth-child(even) { background-color: #f1f5f9; }
-tbody td { padding: 6px 9px; border-bottom: 1px solid #e2e8f0; }
+thead tr { background: #1e40af; color: white; }
+thead th { padding: 6px 8px; text-align: left; font-weight: 600; }
+tbody tr:nth-child(even) { background: #f8fafc; }
+tbody td { padding: 5px 8px; border-bottom: 1px solid #e2e8f0; }
 
 code {
-    font-family: 'Courier New', monospace;
-    font-size: 8.5pt;
-    background-color: #f1f5f9;
-    color: #1e40af;
-    padding: 1px 5px;
-    border-radius: 3px;
+  font-family: 'Courier New', monospace;
+  font-size: 8pt;
+  background: #f1f5f9;
+  color: #1e40af;
+  padding: 1px 5px;
+  border-radius: 3px;
 }
 
-pre {
-    background-color: #0f172a;
-    color: #e2e8f0;
-    font-family: 'Courier New', monospace;
-    font-size: 8pt;
-    padding: 12px 14px;
-    border-radius: 6px;
-    margin: 10px 0;
-    line-height: 1.55;
-    page-break-inside: avoid;
-}
+hr { border: none; border-top: 1px solid #e2e8f0; margin: 18px 0; }
 
-pre code { background: none; color: inherit; padding: 0; }
-
-hr { border: none; border-top: 1px solid #e2e8f0; margin: 20px 0; }
-
-ul, ol { padding-left: 20px; margin: 4px 0 10px 0; }
+ul, ol { padding-left: 18px; margin: 4px 0 8px 0; }
 li { margin-bottom: 3px; }
 
 .chart-block {
-    margin: 18px 0 22px 0;
-    text-align: center;
-    page-break-inside: avoid;
+  margin: 16px 0 20px 0;
+  text-align: center;
+  page-break-inside: avoid;
 }
 
 .chart-block img {
-    max-width: 100%;
-    border-radius: 6px;
-    box-shadow: 0 1px 4px rgba(0,0,0,0.10);
+  max-width: 100%;
+  border-radius: 5px;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.10);
 }
 
 .chart-caption {
-    font-size: 8.5pt;
-    color: #64748b;
-    margin-top: 5px;
-    font-style: italic;
+  font-size: 8pt;
+  color: #64748b;
+  margin-top: 4px;
+  font-style: italic;
 }
 
-.section-charts { page-break-before: always; }
+.page-break { page-break-before: always; }
 """
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Build HTML
+# HTML assembly
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _img_tag(b64: str, caption: str) -> str:
+def img_block(b64: str, caption: str) -> str:
     return (
         f'<div class="chart-block">'
         f'<img src="data:image/png;base64,{b64}" alt="{caption}">'
@@ -326,46 +722,68 @@ def _img_tag(b64: str, caption: str) -> str:
     )
 
 
-def build_html(md_text: str, charts: dict[str, str]) -> str:
-    md = mdlib.Markdown(extensions=["tables", "fenced_code", "nl2br"])
-    body = md.convert(md_text)
+def build_html(charts: dict[str, str], metrics_table: str) -> str:
+    md = mdlib.Markdown(extensions=["tables", "fenced_code"])
+    body = md.convert(REPORT_MD)
 
-    charts_html = f"""
-<div class="section-charts">
-<h2>Appendix — Charts and Visualisations</h2>
+    charts_section = f"""
+{metrics_table}
 
-<h3>Chart 1 — SPY: Strategy vs Buy-and-Hold</h3>
-<p>The strategy uses SMA 200. The buy-and-hold baseline holds SPY continuously for the full period.
-Both series start at $100,000.</p>
-{_img_tag(charts['spy_1x'], "SPY — Equity Curve (top) and Drawdown from Peak (bottom). Strategy = SMA 200.")}
+<div class="page-break"></div>
+<h2>Charts</h2>
 
-<h3>Chart 2 — SPY 3x (UPRO): Strategy vs Buy-and-Hold</h3>
-<p>The strategy applies the SMA 200 timing rule to UPRO. When the signal exits, the position moves to
-cash rather than holding a declining 3x instrument. The buy-and-hold holds UPRO from its inception continuously.</p>
-{_img_tag(charts['upro_3x'], "UPRO 3x — Equity Curve and Drawdown. Strategy dramatically reduces underwater periods.")}
+<h3>Chart A — SPY Regime Map</h3>
+<p>The SMA-200 divides history into LONG regimes (green) and RISK-OFF regimes (red).
+The signal is generated at daily close; execution happens at the next session open.</p>
+{img_block(charts['regime'], "SPY price vs SMA-200. Green = long leveraged ETF. Red = move to cash.")}
 
-<h3>Chart 3 — QQQ 3x (TQQQ): Strategy vs Buy-and-Hold</h3>
-<p>The highest CAGR combination in the backtest. TQQQ buy-and-hold shows the severity of leveraged ETF decay
-during prolonged downtrends. The strategy exits to cash during these periods.</p>
-{_img_tag(charts['tqqq_3x'], "TQQQ 3x — Equity Curve and Drawdown. Strategy reduces max drawdown from 82% to 58%.")}
+<h3>Chart B — Growth of $10,000</h3>
+<p>Left panel: SPY 1x — strategy vs buy-and-hold. Right panel: UPRO 3x on a log scale.
+The strategy exits to cash during risk-off periods, dramatically reducing the worst drawdowns
+of the leveraged buy-and-hold position. Both series start at $10,000.</p>
+{img_block(charts['growth'], "Growth of $10,000. Note: UPRO data starts June 2009.")}
 
-<h3>Chart 4 — EMA Sensitivity: Calmar Ratio by EMA Length</h3>
-<p>All five ETFs are shown. A smooth, gradual slope across EMA lengths confirms the result is not
-dependent on one specific parameter value. No ETF shows a sharp spike that would indicate overfitting.</p>
-{_img_tag(charts['sensitivity'], "EMA Sensitivity — Calmar ratio across EMA 180 to EMA 210 for all signal ETFs.")}
-</div>
+<h3>Chart C — Drawdown from Peak</h3>
+<p>The SMA-200 timing rule's primary value is downside protection, not upside capture.
+The strategy significantly truncates the worst drawdowns on both SPY and UPRO.</p>
+{img_block(charts['drawdown'], "Drawdown from peak. Shaded area shows underwater periods.")}
+
+<div class="page-break"></div>
+
+<h3>Chart D — Annualized Volatility Above vs Below SMA</h3>
+<p>Replicates paper Chart 1 (1928–2015), now computed on SPY data from 1993.
+The pattern is consistent: volatility is materially lower when SPY trades above its moving average.
+Paper found 14.7% above vs 26.5% below for the 200-day SMA.</p>
+{img_block(charts['vol_regime'], "Annualized volatility by regime. Paper: 14.7% above vs 26.5% below (200-day, 1928–2015).")}
+
+<h3>Chart E — Annualized Return Above vs Below SMA</h3>
+<p>Replicates paper Chart 3. Returns when SPY is above its SMA are strongly positive;
+returns when below are near zero or negative. The 200-day SMA shows the clearest separation.
+Paper found +14.1% above vs −2.3% below for the 200-day SMA.</p>
+{img_block(charts['ret_regime'], "Annualized return by regime. Paper: +14.1% above vs −2.3% below (200-day, 1928–2015).")}
+
+<h3>Chart F — Rolling 3-Year Outperformance</h3>
+<p>Replicates paper Chart 9. Shows how much the LRS outperforms (or underperforms) buy-and-hold
+on a rolling 3-year basis. Periods below zero are when the strategy lagged the market — typically
+strong uninterrupted bull runs (1995–2000, 2013–2021).</p>
+{img_block(charts['rolling'], "Rolling 3-year annualised outperformance vs buy-and-hold. Dashed = zero line.")}
+
+<h3>Chart G — Calendar Year Returns</h3>
+<p>Year-by-year comparison of strategy (blue) vs buy-and-hold (gray).
+The strategy underperforms in strong bull years but protects capital in bear years (2000, 2002, 2008, 2022).</p>
+{img_block(charts['calendar'], "Calendar year returns. Strategy protects in bear years at the cost of some bull-year upside.")}
 """
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Gayed LRS Strategy — Phase 1 Final Review</title>
+<title>Gayed LRS — Personal Trade Review</title>
 <style>{CSS}</style>
 </head>
 <body>
 {body}
-{charts_html}
+{charts_section}
 </body>
 </html>"""
 
@@ -375,54 +793,47 @@ dependent on one specific parameter value. No ETF shows a sharp spike that would
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    if not REPORT_MD.exists():
-        print(f"Cannot find: {REPORT_MD}"); sys.exit(1)
-    if not EQUITY_CSV.exists():
-        print(f"Cannot find: {EQUITY_CSV}"); sys.exit(1)
+    for path in [EQUITY_CSV, METRICS_CSV, PRICES_CSV]:
+        if not path.exists():
+            print(f"Missing file: {path}"); sys.exit(1)
 
-    print("Generating charts (this may take 30–60 seconds while loading equity curves)...")
+    print("Loading data...")
+    df      = load_equity_curves("SMA_200")
+    metrics = load_metrics("SMA_200")
+    prices  = load_spy_prices()
 
+    print("Generating Chart A: SPY regime map...")
     charts: dict[str, str] = {}
+    charts["regime"] = chart_regime_map(prices)
 
-    print("  Chart 1: SPY strategy vs buy-and-hold...")
-    charts["spy_1x"] = chart_equity_and_drawdown(
-        "SPY", "SMA_200", "SPY_1X",
-        title="SPY (1x)",
-        subtitle_strat="Strategy — SMA 200",
-        subtitle_bh="Buy and Hold — SPY",
-        log_scale=False,
-    )
+    print("Generating Chart B: growth of $10,000...")
+    charts["growth"] = chart_growth(df)
 
-    print("  Chart 2: UPRO 3x strategy vs buy-and-hold...")
-    charts["upro_3x"] = chart_equity_and_drawdown(
-        "SPY", "SMA_200", "UPRO_3X",
-        title="SPY Signal → UPRO 3x Execution",
-        subtitle_strat="Strategy — SMA 200 → Cash on exit",
-        subtitle_bh="Buy and Hold — UPRO",
-        log_scale=True,
-    )
+    print("Generating Chart C: drawdown...")
+    charts["drawdown"] = chart_drawdown(df)
 
-    print("  Chart 3: TQQQ 3x strategy vs buy-and-hold...")
-    charts["tqqq_3x"] = chart_equity_and_drawdown(
-        "QQQ", "EMA_200", "TQQQ_3X",
-        title="QQQ Signal → TQQQ 3x Execution",
-        subtitle_strat="Strategy — EMA 200 → Cash on exit",
-        subtitle_bh="Buy and Hold — TQQQ",
-        log_scale=True,
-    )
+    print("Generating Chart D: volatility regime...")
+    charts["vol_regime"] = chart_vol_regime(prices)
 
-    print("  Chart 4: EMA sensitivity across all ETFs...")
-    charts["sensitivity"] = chart_ema_sensitivity()
+    print("Generating Chart E: return regime...")
+    charts["ret_regime"] = chart_return_regime(prices)
 
-    print("Building HTML and rendering PDF...")
-    md_text = REPORT_MD.read_text(encoding="utf-8")
-    html = build_html(md_text, charts)
+    print("Generating Chart F: rolling 3-year outperformance...")
+    charts["rolling"] = chart_rolling_outperformance(df)
 
+    print("Generating Chart G: calendar year returns...")
+    charts["calendar"] = chart_calendar_year(df)
+
+    print("Building metrics table...")
+    metrics_table = build_metrics_table(metrics)
+
+    print("Rendering PDF (this takes ~30–60 seconds)...")
+    html = build_html(charts, metrics_table)
     REPORT_PDF.parent.mkdir(parents=True, exist_ok=True)
     weasyprint.HTML(string=html, base_url=str(Path.cwd())).write_pdf(str(REPORT_PDF))
 
     size_kb = REPORT_PDF.stat().st_size // 1024
-    print(f"\nSaved: {REPORT_PDF.resolve()} ({size_kb} KB)")
+    print(f"\nSaved: {REPORT_PDF.resolve()}  ({size_kb} KB)")
 
 
 if __name__ == "__main__":

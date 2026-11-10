@@ -35,4 +35,9 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
           ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
-        run: python scripts/send_market_alert.py
+        run: |
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              python scripts/send_market_alert.py --force-market
+            else
+              python scripts/send_market_alert.py
+            fi
